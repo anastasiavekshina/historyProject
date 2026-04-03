@@ -99,4 +99,144 @@ def get_soup(url: str) -> BeautifulSoup | None:
         return None
 
 
+def extract_all_articles(soup: BeautifulSoup) -> list[dict]:
+    """
+    Извлекает все статьи из одного HTML-документа.
+    
+    Особенность: ваш сайт — single-page, где список статей и их полное содержание
+    находятся на одной странице, а переходы реализованы через якорные ссылки (#article-1).
+    Поэтому мы не делаем отдельные запросы к каждой статье, а ищем их блоки внутри того же soup.
+    
+    Аргументы:
+        soup (BeautifulSoup): распарсенный HTML-документ всей страницы
+    
+    Возвращает:
+        list[dict]: список словарей, где каждый словарь — данные одной статьи
+    """
+    articles = []           # Список для накопления данных всех статей
+    seen_urls = set()       # Множество для отслеживания уже обработанных URL (защита от дублей)
+
+    # Находим все элементы-ссылки на статьи в списке публикаций по селектору из CONFIG
+    link_elements = soup.select(SELECTORS["list_page"]["article_links"])
+
+    # Проходим по каждой найденной ссылке
+    for link in link_elements:
+        # Получаем значение атрибута href (ссылка на статью)
+        href = link.get("href", "")
+        # Пропускаем ссылки, которые пустые или не ведут на якорь статьи (#article-...)
+        if not href or not href.startswith("#article-"):
+            continue
+
+        # Формируем полный "виртуальный" URL статьи: базовый адрес + якорь
+        # Это нужно для уникальной идентификации статьи в данных
+        article_url = f"{CONFIG['page_url']}{href}"
+        # Если статья с таким URL уже обработана — пропускаем (дедупликация)
+        if article_url in seen_urls:
+            continue
+        seen_urls.add(article_url)
+
+        # Извлекаем ID статьи из якоря: "#article-1" → "article-1"
+        article_id = href.replace("#", "")
+        # Ищем в документе блок с полным содержанием статьи по этому ID
+        detail_section = soup.find(id=article_id)
+
+        # Если блок с деталями не найден — записываем предупреждение и переходим к следующей
+        if not detail_section:
+            
+            continue
+
+        # Создаём новый BeautifulSoup-объект только для блока с деталями статьи
+        # Это нужно, чтобы селекторы искали элементы внутри этой статьи, а не во всём документе
+        detail_soup = BeautifulSoup(str(detail_section), "html.parser")
+
+        # Вспомогательные функции для безопасного извлечения текста
+        def safe_text(sel: str) -> str | None:
+            """
+            Возвращает текст первого найденного элемента по селектору, или None если не найдено.
+            
+            Аргументы:
+                sel (str): CSS-селектор для поиска элемента
+            
+            Возвращает:
+                str | None: очищенный от пробелов текст или None
+            """
+            el = detail_soup.select_one(sel)  # Ищем один элемент по селектору
+            return el.get_text(strip=True) if el else None  # Если найдено — возвращаем текст, иначе None
+
+        def safe_list(sel: str) -> list[str]:
+            """
+            Возвращает список текстов всех найденных элементов по селектору.
+
+            Аргументы:
+                sel (str): CSS-селектор для поиска элементов
+
+            Возвращает:
+                list[str]: список непустых текстовых значений
+            """
+            els = detail_soup.select(sel)
+            return [el.get_text(strip=True) for el in els if el.get_text(strip=True)]
+
+        # Пытаемся взять краткое описание (эксперт) из превью в списке статей
+        # Это резервный вариант: если в полной версии статьи нет excerpt, возьмём из списка
+        preview = link.find_parent("article.post")  # Находим родительский <article> для ссылки
+        excerpt = None
+        if preview:  # Если родитель найден
+            exc_el = preview.select_one("p.post-excerpt")  # Ищем элемент с кратким описанием
+            if exc_el:  # Если элемент найден
+                excerpt = exc_el.get_text(strip=True)  # Сохраняем его текст
+
+        # Теги (источник для региона/тем)
+        tags_list = safe_list(SELECTORS["detail_page"]["tags"])
+        region = safe_text(SELECTORS["detail_page"]["region"]) or (tags_list[0] if tags_list else None)
+        themes_list = safe_list(SELECTORS["detail_page"]["themes"]) or (tags_list[1:] if len(tags_list) > 1 else [])
+
+        # Формируем словарь с данными статьи — структура, которая попадёт в CSV
+        article_data = {
+            "url": article_url,  # Виртуальный адрес статьи
+            "title": safe_text(SELECTORS["detail_page"]["title"]),  # Заголовок
+            "publish_date": safe_text(SELECTORS["detail_page"]["date"]),  # Дата публикации
+            "author": safe_text(SELECTORS["detail_page"]["author"]),  # Автор
+            "region": region,  # Регион (для новых диаграмм)
+            "themes": ", ".join(themes_list) if themes_list else None,  # Темы (для новых диаграмм)
+            # Краткое описание: берём из превью, если есть, иначе — из полной версии
+            "excerpt": excerpt or safe_text(SELECTORS["detail_page"]["excerpt"]),
+            "tags": ", ".join(tags_list) if tags_list else None,  # Теги (через запятую)
+        }
+
+        # Добавляем статью в список только если заголовок успешно извлечён (валидация качества)
+        if article_data["title"]:
+            articles.append(article_data)
+            # Записываем в лог успешный парсинг (обрезаем заголовок до 50 символов для краткости)
+            
+
+    # Возвращаем список всех собранных статей
+    return articles
+
+
+def run_parser() -> list[dict]:
+    """
+    Главная функция парсера: выполняет загрузку страницы и извлечение данных.
+    
+    Возвращает:
+        list[dict]: список словарей с данными статей
+    """
+    # Записываем в лог начало процесса с указанием целевого URL
+    
+    
+    # Загружаем и парсим HTML-страницу через функцию get_soup
+    soup = get_soup(CONFIG["page_url"])
+    # Если загрузка не удалась (soup is None) — возвращаем пустой список
+    if not soup:
+        return []
+
+    # Записываем в лог начало извлечения статей
+    
+    # Вызываем функцию извлечения всех статей из распарсенного документа
+    collected = extract_all_articles(soup)
+    # Записываем в лог итоговое количество собранных статей
+    
+    
+    # Возвращаем список собранных данных
+    return collected
+
 
